@@ -1,0 +1,148 @@
+--- /mnt/data/279df2d5-a3bf-4c5a-a21a-f65c2e2a746f.txt	2026-09-22 13:07:39.101899445 +0000
++++ /mnt/data/better_fastlio2_realtime_perf_v1/CMakeLists.txt	2026-09-22 13:09:43.154052172 +0000
+@@ -8,26 +8,23 @@
+ set(CMAKE_CXX_EXTENSIONS OFF)
+ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread -fexceptions")
+ add_definitions(-DROOT_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/\")
+-# Processor count logic
+-if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86)|(X86)|(amd64)|(AMD64)" )
+-  include(ProcessorCount)
+-  ProcessorCount(N)
+-  if(N GREATER 4)
+-    add_definitions(-DMP_EN -DMP_PROC_NUM=3)
+-  elseif(N GREATER 3)
+-    add_definitions(-DMP_EN -DMP_PROC_NUM=2)
+-  else()
+-    add_definitions(-DMP_PROC_NUM=1)
+-  endif()
+-else()
+-  add_definitions(-DMP_PROC_NUM=1)
++# Real-time performance defaults.
++# The upstream configuration enabled MP_EN only on x86/amd64, which leaves
++# aarch64/ARM (for example Unitree onboard computers) on the serial
++# h_share_model() path.  Enable OpenMP on every supported architecture.
++if(NOT CMAKE_BUILD_TYPE)
++  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+ endif()
++set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
+ 
+-# Include directories and dependencies
+-find_package(OpenMP QUIET)
+-if (OPENMP_FOUND)
++set(FASTLIO_OMP_THREADS 4 CACHE STRING "OpenMP threads used by FAST-LIO scan-to-map")
++find_package(OpenMP REQUIRED)
++if(OpenMP_CXX_FOUND)
++  message(STATUS "FAST-LIO OpenMP enabled: ${FASTLIO_OMP_THREADS} threads on ${CMAKE_SYSTEM_PROCESSOR}")
++  add_definitions(-DMP_EN -DMP_PROC_NUM=${FASTLIO_OMP_THREADS})
++  # Keep these flags for CMake 3.10 / older ROS toolchains.
+   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
+-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}   ${OpenMP_C_FLAGS}")
++  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
+ endif()
+ 
+ find_package(PythonLibs REQUIRED)
+@@ -76,6 +73,9 @@
+ # Executables and linkage with stdc++fs
+ add_executable(fastlio_sam_mapping src/laserMapping.cpp)
+ target_link_libraries(fastlio_sam_mapping ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${PYTHON_LIBRARIES} ${GeographicLib_LIBRARIES} ${OpenCV_LIBRARIES} ikd_Tree preprocess sc gtsam stdc++fs)
++if(TARGET OpenMP::OpenMP_CXX)
++  target_link_libraries(fastlio_sam_mapping OpenMP::OpenMP_CXX)
++endif()
+ 
+ add_executable(multi_session src/multi_session.cpp)
+ target_link_libraries(multi_session ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${PYTHON_LIBRARIES} ${GeographicLib_LIBRARIES} incremental_mapping gtsam stdc++fs)
+--- /mnt/data/laserMapping.cpp	2026-09-22 13:07:39.421908093 +0000
++++ /mnt/data/better_fastlio2_realtime_perf_v1/laserMapping.cpp	2026-09-22 13:09:43.154826955 +0000
+@@ -99,6 +99,41 @@
+ deque<pcl::PointCloud<PointType>::Ptr> lidar_buffer;      // 记录特征提取或间隔采样后的lidar(特征)数据
+ deque<sensor_msgs::Imu::ConstPtr> imu_buffer; // IMU数据缓存队列
+ 
++// Real-time policy: never let LiDAR latency grow without bound.
++// A navigation front-end should prefer a recent scan over processing every
++// historical scan when CPU load temporarily exceeds the sensor rate.
++static constexpr size_t MAX_LIDAR_BACKLOG = 3;
++uint64_t dropped_lidar_backlog = 0;
++
++// mtx_buffer must already be held when this function is called.  If
++// sync_packages() is waiting for IMU with lidar_pushed=true, index 0 is the
++// scan currently referenced by Measures and must not be removed.
++inline void trim_lidar_backlog_locked()
++{
++    while (lidar_buffer.size() >= MAX_LIDAR_BACKLOG)
++    {
++        if (lidar_pushed && lidar_buffer.size() > 1)
++        {
++            lidar_buffer.erase(lidar_buffer.begin() + 1);
++            time_buffer.erase(time_buffer.begin() + 1);
++        }
++        else
++        {
++            lidar_buffer.pop_front();
++            time_buffer.pop_front();
++        }
++        ++dropped_lidar_backlog;
++    }
++
++    if (dropped_lidar_backlog > 0)
++    {
++        ROS_WARN_THROTTLE(2.0,
++                          "FAST-LIO realtime backlog: dropped %lu old LiDAR scans, buffered=%zu",
++                          static_cast<unsigned long>(dropped_lidar_backlog),
++                          lidar_buffer.size());
++    }
++}
++
+ pcl::PointCloud<PointType>::Ptr featsFromMap(new pcl::PointCloud<PointType>());           // 提取地图中的特征点,ikdtree获得
+ pcl::PointCloud<PointType>::Ptr feats_undistort(new pcl::PointCloud<PointType>());        // 去畸变的点云,lidar系
+ pcl::PointCloud<PointType>::Ptr feats_undistort_copy(new pcl::PointCloud<PointType>());        // 去畸变的点云,lidar系
+@@ -1213,6 +1248,7 @@
+     }
+     pcl::PointCloud<PointType>::Ptr ptr(new pcl::PointCloud<PointType>());
+     p_pre->process(msg, ptr);                         // 点云预处理
++    trim_lidar_backlog_locked();                      // 丢弃过旧scan，保持实时性
+     lidar_buffer.push_back(ptr);                      // 点云存入缓冲区
+     time_buffer.push_back(msg->header.stamp.toSec()); // 时间存入缓冲区
+     last_timestamp_lidar = msg->header.stamp.toSec(); // 记录最后一个雷达时间
+@@ -1235,6 +1271,8 @@
+     {
+         ROS_ERROR("lidar loop back, clear buffer");
+         lidar_buffer.clear();
++        time_buffer.clear();
++        lidar_pushed = false;
+     }
+     last_timestamp_lidar = msg->header.stamp.toSec(); // 记录最后一个雷达时间
+     // 如果不需要进行时间同步,而imu时间戳和雷达时间戳相差大于10s,则输出错误信息
+@@ -1253,6 +1291,7 @@
+     pcl::PointCloud<PointType>::Ptr ptr(new pcl::PointCloud<PointType>());
+ 
+     p_pre->process(msg, ptr);                    // 点云预处理
++    trim_lidar_backlog_locked();                 // 丢弃过旧scan，避免10Hz输入在慢前端中累计分钟级延迟
+     lidar_buffer.push_back(ptr);                 // 点云存入缓冲区
+     time_buffer.push_back(last_timestamp_lidar); // 时间存入缓冲区
+ 
+@@ -1272,6 +1311,8 @@
+     {
+         ROS_ERROR("lidar loop back, clear buffer");
+         lidar_buffer.clear();
++        time_buffer.clear();
++        lidar_pushed = false;
+     }
+ 
+     last_timestamp_lidar = msg->header.stamp.toSec(); // 记录最后一个雷达时间
+@@ -2178,8 +2219,14 @@
+     // ROS订阅器和发布器的定义和初始化
+     string repub_topic = lid_topic + "_repub";
+     // std::cout << repub_topic << std::endl;
+-    ros::Subscriber sub_pcl = p_pre->lidar_type == LIVOX ? (p_pre->livox_type == LIVOX_CUS ? nh.subscribe(lid_topic, 200000, livox_pcl_cbk) : nh.subscribe(repub_topic, 200000, livox_ros_cbk)) : nh.subscribe(lid_topic, 200000, standard_pcl_cbk);
+-    ros::Subscriber sub_imu = nh.subscribe(imu_topic, 200000, imu_cbk);
++    // Keep LiDAR subscriber queues deliberately short: if the front-end is
++    // slower than the sensor, roscpp should drop stale scans instead of
++    // accumulating minutes of latency. IMU retains a larger queue because all
++    // samples between two selected LiDAR scans are useful for propagation.
++    constexpr uint32_t LIDAR_SUB_QUEUE = 5;
++    constexpr uint32_t IMU_SUB_QUEUE = 1000;
++    ros::Subscriber sub_pcl = p_pre->lidar_type == LIVOX ? (p_pre->livox_type == LIVOX_CUS ? nh.subscribe(lid_topic, LIDAR_SUB_QUEUE, livox_pcl_cbk) : nh.subscribe(repub_topic, LIDAR_SUB_QUEUE, livox_ros_cbk)) : nh.subscribe(lid_topic, LIDAR_SUB_QUEUE, standard_pcl_cbk);
++    ros::Subscriber sub_imu = nh.subscribe(imu_topic, IMU_SUB_QUEUE, imu_cbk);
+     // ros::Subscriber subLivoxMsg = nh.subscribe<livox_ros_driver::CustomMsg>(lid_topic, 100000, LivoxRepubCallback);
+     
+     if (camera_en){
